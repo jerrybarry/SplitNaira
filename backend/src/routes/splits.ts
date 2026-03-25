@@ -76,6 +76,38 @@ const lockProjectSchema = z.object({
   owner: z.string().min(1, "owner is required")
 });
 
+const updateCollaboratorsSchema = z
+  .object({
+    owner: z.string().min(1, "owner is required"),
+    collaborators: z.array(collaboratorSchema).min(2, "at least 2 collaborators are required")
+  })
+  .superRefine((payload, ctx) => {
+    const totalBasisPoints = payload.collaborators.reduce(
+      (sum, collaborator) => sum + collaborator.basisPoints,
+      0
+    );
+    if (totalBasisPoints !== 10_000) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["collaborators"],
+        message: "collaborators basisPoints must sum to exactly 10000"
+      });
+    }
+
+    const addresses = new Set<string>();
+    for (const collaborator of payload.collaborators) {
+      if (addresses.has(collaborator.address)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["collaborators"],
+          message: "duplicate collaborator address found"
+        });
+        break;
+      }
+      addresses.add(collaborator.address);
+    }
+  });
+
 function toCollaboratorScVal(collaborator: z.infer<typeof collaboratorSchema>) {
   return xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
@@ -208,6 +240,69 @@ async function buildLockProjectUnsignedXdr(input: { projectId: string } & z.infe
   };
 }
 
+type UpdateCollaboratorsInput = {
+  projectId: string;
+} & z.infer<typeof updateCollaboratorsSchema>;
+
+async function buildUpdateCollaboratorsUnsignedXdr(input: UpdateCollaboratorsInput) {
+  const config = loadStellarConfig();
+  const server = new rpc.Server(config.sorobanRpcUrl, { allowHttp: true });
+
+  let sourceAccount;
+  try {
+    sourceAccount = await server.getAccount(input.owner);
+  } catch {
+    throw new RequestValidationError("owner account not found on selected network");
+  }
+
+  let ownerAddress: Address;
+  try {
+    ownerAddress = Address.fromString(input.owner);
+  } catch {
+    throw new RequestValidationError("owner must be a valid Stellar address");
+  }
+
+  let collaboratorScVals: xdr.ScVal[];
+  try {
+    collaboratorScVals = input.collaborators.map((collaborator) =>
+      toCollaboratorScVal(collaborator)
+    );
+  } catch {
+    throw new RequestValidationError("collaborator addresses must be valid Stellar addresses");
+  }
+
+  const contract = new Contract(config.contractId);
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase: config.networkPassphrase
+  })
+    .addOperation(
+      contract.call(
+        "update_collaborators",
+        nativeToScVal(input.projectId, { type: "symbol" }),
+        ownerAddress.toScVal(),
+        xdr.ScVal.scvVec(collaboratorScVals)
+      )
+    )
+    .setTimeout(300)
+    .build();
+
+  const preparedTx = await server.prepareTransaction(tx);
+
+  return {
+    xdr: preparedTx.toXDR(),
+    metadata: {
+      contractId: config.contractId,
+      networkPassphrase: config.networkPassphrase,
+      sourceAccount: input.owner,
+      sequenceNumber: preparedTx.sequence,
+      fee: preparedTx.fee,
+      operation: "update_collaborators"
+    }
+  };
+}
+
 async function fetchProjectById(projectId: string) {
   const config = loadStellarConfig();
   const server = new rpc.Server(config.sorobanRpcUrl, { allowHttp: true });
@@ -331,6 +426,47 @@ splitsRouter.post("/:projectId/lock", async (req, res, next) => {
       const result = await buildLockProjectUnsignedXdr({
         projectId: parsedParams.data,
         owner: parsedBody.data.owner
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      if (error instanceof RequestValidationError) {
+        return res.status(400).json({
+          error: "validation_error",
+          message: error.message,
+          requestId
+        });
+      }
+      throw error;
+    }
+  } catch (error) {
+    return next(error);
+  }
+});
+
+splitsRouter.put("/:projectId/collaborators", async (req, res, next) => {
+  try {
+    const requestId = res.locals.requestId;
+
+    const parsedParams = projectIdParamSchema.safeParse(req.params.projectId);
+    const parsedBody = updateCollaboratorsSchema.safeParse(req.body);
+
+    if (!parsedParams.success || !parsedBody.success) {
+      return res.status(400).json({
+        error: "validation_error",
+        message: "Invalid request payload.",
+        details: {
+          params: parsedParams.success ? null : parsedParams.error.flatten(),
+          body: parsedBody.success ? null : parsedBody.error.flatten()
+        },
+        requestId
+      });
+    }
+
+    try {
+      const result = await buildUpdateCollaboratorsUnsignedXdr({
+        projectId: parsedParams.data,
+        owner: parsedBody.data.owner,
+        collaborators: parsedBody.data.collaborators
       });
       return res.status(200).json(result);
     } catch (error) {
