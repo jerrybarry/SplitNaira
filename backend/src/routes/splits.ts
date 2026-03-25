@@ -371,7 +371,8 @@ const distributeSchema = z.object({
 
 splitsRouter.post("/:projectId/distribute", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const projectId = req.params.projectId?.trim();
+    const projectIdRaw = req.params.projectId;
+    const projectId = typeof projectIdRaw === "string" ? projectIdRaw.trim() : "";
     if (!projectId) {
       return res.status(400).json({
         error: "validation_error",
@@ -424,6 +425,77 @@ splitsRouter.post("/:projectId/distribute", async (req: Request, res: Response, 
         operation: "distribute"
       }
     });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+splitsRouter.get("/:projectId/history", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const projectIdRaw = req.params.projectId;
+    const projectId = typeof projectIdRaw === "string" ? projectIdRaw.trim() : "";
+    if (!projectId) {
+      return res.status(400).json({
+        error: "validation_error",
+        message: "projectId is required"
+      });
+    }
+
+    const config = loadStellarConfig();
+    const server = new rpc.Server(config.sorobanRpcUrl, { allowHttp: true });
+
+    const projectIdSymbol = nativeToScVal(projectId, { type: "symbol" });
+
+    // 1. Fetch distribution_complete events
+    const roundEventResponse = await server.getEvents({
+      filters: [
+        {
+          type: "contract",
+          contractIds: [config.contractId],
+          topics: [[nativeToScVal("distribution_complete", { type: "symbol" }), projectIdSymbol]]
+        }
+      ],
+      limit: 100
+    });
+
+    // 2. Fetch payment_sent events
+    const paymentEventResponse = await server.getEvents({
+      filters: [
+        {
+          type: "contract",
+          contractIds: [config.contractId],
+          topics: [[nativeToScVal("payment_sent", { type: "symbol" }), projectIdSymbol]]
+        }
+      ],
+      limit: 100
+    });
+
+    const events = [
+      ...roundEventResponse.events.map((e) => {
+        const data = scValToNative(e.value) as [number, string | number | bigint];
+        return {
+          type: "round",
+          round: data[0],
+          amount: String(data[1]),
+          txHash: e.txHash,
+          ledgerCloseTime: e.ledgerClosedAt,
+          id: e.id
+        };
+      }),
+      ...paymentEventResponse.events.map((e) => {
+        const data = scValToNative(e.value) as [string, string | number | bigint];
+        return {
+          type: "payment",
+          recipient: data[0],
+          amount: String(data[1]),
+          txHash: e.txHash,
+          ledgerCloseTime: e.ledgerClosedAt,
+          id: e.id
+        };
+      })
+    ].sort((a, b) => b.ledgerCloseTime.localeCompare(a.ledgerCloseTime));
+
+    return res.status(200).json(events);
   } catch (error) {
     return next(error);
   }
